@@ -25,8 +25,8 @@ test("lê os campos: remove as aspas, aceita facção vazia e converte os númer
 
   assert.equal(linhasInvalidas, 0);
   assert.deepEqual(posicoes, [
-    { id: 7, timestamp: "2024-01-01 00:00:00", coordenadas: { lat: -13.06443, lon: -46.56289 } },
-    { id: 9, timestamp: "2024-01-01 00:00:00", coordenadas: { lat: 1.64046, lon: -69.5395 } },
+    { id: 7, timestamp: "2024-01-01 00:00:00", lat: -13.06443, lon: -46.56289 },
+    { id: 9, timestamp: "2024-01-01 00:00:00", lat: 1.64046, lon: -69.5395 },
   ]);
   assert.equal(cadastro.get(7)?.idFaccao, 1);
   assert.equal(cadastro.get(7)?.ehVitima, false);
@@ -65,15 +65,15 @@ test("descarta e conta linhas inválidas, sem interromper a leitura", () => {
   const invalidas = [
     "lixo",
     '1;;"t1";1',
-    '1;;"t1";;2;false;', // latitude vazia não pode virar 0
+    '1;;"t1";;2;false;',
     '1;;"t1";abc;2;false;',
-    '1;;"t1";91;2;false;', // latitude fora da faixa
+    '1;;"t1";91;2;false;',
     'x;;"t1";1;2;false;',
     ';;"t1";1;2;false;',
-    '1;;;1;2;false;', // sem timestamp
+    '1;;;1;2;false;',
     '1;;"t1";1;2;talvez;',
-    '1;x;"t1";1;2;false;', // facção não numérica
-    '1;;"t1";1;2;true;"a"', // agressor não numérico
+    '1;x;"t1";1;2;false;',
+    '1;;"t1";1;2;true;"a"',
   ];
 
   const { posicoes, cadastro, linhasInvalidas } = parsear([...invalidas, '2;;"t1";1;2;false;'].join("\n"));
@@ -83,6 +83,7 @@ test("descarta e conta linhas inválidas, sem interromper a leitura", () => {
   assert.deepEqual([...cadastro.keys()], [2]);
 });
 
+/** Blocos menores que uma linha obrigam a guardar o pedaço pendente e a fazer o bloco crescer. */
 test("lerArquivo devolve o mesmo resultado com linhas cortadas entre blocos", () => {
   const conteudo = [
     CABECALHO,
@@ -99,7 +100,6 @@ test("lerArquivo devolve o mesmo resultado com linhas cortadas entre blocos", ()
     const caminho = join(pasta, "dados.txt");
     writeFileSync(caminho, conteudo);
 
-    // Blocos menores que uma linha obrigam a guardar o pedaço pendente e a fazer o bloco crescer.
     for (const tamanhoBloco of [1, 7, 16, 64, 1024]) {
       const posicoes: Posicao[] = [];
       const dados = lerArquivo(caminho, (posicao) => posicoes.push(posicao), tamanhoBloco);

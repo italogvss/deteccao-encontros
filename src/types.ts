@@ -13,22 +13,21 @@ export interface Pessoa {
   restricoes: Set<number>;
 }
 
+export interface Coordenadas {
+  lat: number;
+  lon: number;
+}
+
 /** Onde uma pessoa estava em um instante. */
-export interface Posicao {
+export interface Posicao extends Coordenadas {
   id: number;
   timestamp: string;
-  coordenadas: Coordenadas;
 }
 
 export interface DadosEntrada {
   cadastro: Map<number, Pessoa>;
   /** Linhas descartadas por formato inválido. */
   linhasInvalidas: number;
-}
-
-export interface Coordenadas {
-  lat: number;
-  lon: number;
 }
 
 /** Um registro do JSON de saída. */
