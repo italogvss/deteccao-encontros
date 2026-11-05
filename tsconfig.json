@@ -9,5 +9,5 @@
     "strict": true,
     "skipLibCheck": true
   },
-  "include": ["src", "scripts", "tests"]
+  "include": ["src", "tests"]
 }

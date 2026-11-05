@@ -10,8 +10,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/src/index.js",
-    "test": "npm run build && node --test \"dist/tests/**/*.test.js\"",
-    "compare": "node dist/scripts/compare.js"
+    "test": "npm run build && node --test \"dist/tests/**/*.test.js\""
   },
   "devDependencies": {
     "@types/node": "^24.19.2",

@@ -24,7 +24,7 @@ function processarArquivo(caminho: string, opcoes: OpcoesClassificacao): void {
   const nome = basename(caminho, extname(caminho));
   const inicio = performance.now();
   const { encontros, linhasInvalidas, posicoesRepetidas } = detectarEncontros(
-    (aoLerPosicao) => lerArquivo(caminho, aoLerPosicao),
+    (consumidor) => lerArquivo(caminho, consumidor),
     opcoes,
   );
   gravarEncontros(join(PASTA_SAIDA, `${nome}.json`), encontros);

@@ -6,8 +6,8 @@ import type { Pessoa } from "../src/types";
 
 /** Monta as pessoas pelo parser real, para cobrir também o vínculo nos dois sentidos. */
 function cadastrar(...linhas: string[]): (id: number) => Pessoa {
-  const { cadastro } = parsearConteudo(linhas.join("\n"), () => {});
-  return (id) => cadastro.get(id)!;
+  const dados = parsearConteudo(linhas.join("\n"), { aoMudarTimestamp: () => true, aoLerPosicao: () => {} });
+  return (id) => dados!.cadastro.get(id)!;
 }
 
 function classificarNasDuasOrdens(a: Pessoa, b: Pessoa) {

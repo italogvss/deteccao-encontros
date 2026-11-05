@@ -1,29 +1,47 @@
 import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import type { DadosEntrada, Pessoa, Posicao } from "./types";
 
-/** O limite de string do Node é ~512 MB: ler em blocos é o que permite abrir arquivos maiores que isso. */
-const TAMANHO_BLOCO = 64 * 1024 * 1024;
-const QUEBRA_DE_LINHA = 0x0a;
+const TAMANHO_BLOCO = 1024 * 1024;
 const CABECALHO = "idMonitorado;";
 
-/** Chamado uma vez por linha válida. O parser não acumula posições: a memória não cresce com o arquivo. */
-export type AoLerPosicao = (posicao: Posicao) => void;
+const QUEBRA_DE_LINHA = 0x0a;
+const ASPAS = 0x22;
+const HIFEN = 0x2d;
+const PONTO = 0x2e;
+const DIGITO_0 = 0x30;
+const DIGITO_9 = 0x39;
+const PONTO_E_VIRGULA = 0x3b;
+
+/** IDs a partir daqui continuam corretos, mas sempre pelo caminho lento. */
+const LIMITE_ID_RAPIDO = 65_536;
+const MAX_DIGITOS_EXATOS = 15;
+const POTENCIAS_DE_10 = [1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15];
+
+let fimDoUltimoDecimal = 0;
 
 /**
- * Lê um arquivo de qualquer tamanho, em blocos.
+ * Recebe as posições sem criar um objeto por linha. As posições seguintes pertencem ao último timestamp
+ * informado; retornar `false` em `aoMudarTimestamp` interrompe a leitura.
+ */
+export interface ConsumidorPosicoes {
+  aoMudarTimestamp(timestamp: string): boolean;
+  aoLerPosicao(id: number, lat: number, lon: number): void;
+}
+
+/**
+ * Lê um arquivo de qualquer tamanho, em blocos, e retorna `null` se o consumidor interromper a leitura.
  *
- * O bloco é limitado ao tamanho do arquivo porque alocar 64 MB custa mais que ler um arquivo pequeno
- * inteiro; o byte extra deixa espaço para detectar o fim do arquivo sem fazê-lo crescer à toa. Os bytes
- * da linha incompleta ficam no início do bloco à espera do restante, e só uma linha maior que o bloco
- * inteiro o faz crescer. Cortar na quebra de linha também protege os caracteres UTF-8: o byte 0x0a nunca
- * faz parte de um deles. O último trecho cobre um arquivo que não termina com quebra de linha.
+ * O byte extra no tamanho do bloco deixa espaço para detectar o fim do arquivo. Os bytes da linha
+ * incompleta ficam no início do bloco à espera do restante, e só uma linha maior que o bloco o faz
+ * crescer. O último trecho recebe uma quebra de linha, porque todo texto entregue ao leitor termina com
+ * uma; há espaço para ela, já que o bloco cresce antes de cada leitura quando está cheio.
  */
 export function lerArquivo(
   caminho: string,
-  aoLerPosicao: AoLerPosicao,
+  consumidor: ConsumidorPosicoes,
   tamanhoBloco: number = TAMANHO_BLOCO,
-): DadosEntrada {
-  const leitor = criarLeitor(aoLerPosicao);
+): DadosEntrada | null {
+  const leitor = criarLeitor(consumidor);
   const arquivo = openSync(caminho, "r");
 
   try {
@@ -47,12 +65,15 @@ export function lerArquivo(
         continue;
       }
 
-      leitor.processarTexto(bloco.toString("utf8", 0, ultimaQuebra + 1));
+      if (!leitor.processarBytes(bloco, ultimaQuebra + 1)) return null;
       bloco.copy(bloco, 0, ultimaQuebra + 1, total);
       pendentes = total - ultimaQuebra - 1;
     }
 
-    if (pendentes > 0) leitor.processarTexto(bloco.toString("utf8", 0, pendentes));
+    if (pendentes > 0) {
+      bloco[pendentes] = QUEBRA_DE_LINHA;
+      if (!leitor.processarBytes(bloco, pendentes + 1)) return null;
+    }
   } finally {
     closeSync(arquivo);
   }
@@ -61,54 +82,94 @@ export function lerArquivo(
 }
 
 /** Mesmo caminho do `lerArquivo`, para conteúdo já em memória. */
-export function parsearConteudo(conteudo: string, aoLerPosicao: AoLerPosicao): DadosEntrada {
-  const leitor = criarLeitor(aoLerPosicao);
-  leitor.processarTexto(conteudo);
-  return leitor.concluir();
+export function parsearConteudo(conteudo: string, consumidor: ConsumidorPosicoes): DadosEntrada | null {
+  const leitor = criarLeitor(consumidor);
+  const bytes = Buffer.from(`${conteudo}\n`);
+  return leitor.processarBytes(bytes, bytes.length) ? leitor.concluir() : null;
 }
 
-function criarLeitor(aoLerPosicao: AoLerPosicao) {
+function criarLeitor(consumidor: ConsumidorPosicoes) {
   const cadastro = new Map<number, Pessoa>();
-  const copiarTimestamp = criarCopiadorDeTimestamps();
+  const idsConhecidos = new Uint8Array(LIMITE_ID_RAPIDO);
+  let timestampAtual = "";
+  let bytesTimestamp: Buffer = Buffer.alloc(0);
   let linhasInvalidas = 0;
 
   /**
-   * O `trim` remove o `\r`, os espaços e o BOM do início do arquivo. O cabeçalho é reconhecido pelo
-   * conteúdo, para um arquivo sem cabeçalho não perder a primeira linha de dados. Os dados da pessoa são
-   * fixos por ID, então só são lidos na primeira linha válida do ID.
+   * Caminho rápido: lê a linha direto dos bytes, sem criar nenhuma string, e retorna onde começa a próxima.
+   * Só aceita uma pessoa já cadastrada, no timestamp atual e com coordenadas no formato simples. Qualquer
+   * outro caso retorna -1, e a linha passa pelo caminho lento, que decide se ela é válida.
    */
-  function processarLinha(linhaBruta: string): void {
+  function processarLinhaRapida(bytes: Buffer, inicio: number): number {
+    const fimId = fimDoCampo(bytes, inicio);
+    if (fimId < 0) return -1;
+    const id = lerInteiro(bytes, inicio, fimId);
+    if (id < 0 || id >= LIMITE_ID_RAPIDO || idsConhecidos[id] === 0) return -1;
+
+    const fimFaccao = fimDoCampo(bytes, fimId + 1);
+    if (fimFaccao < 0 || !ehTimestamp(bytes, fimFaccao + 1, bytesTimestamp)) return -1;
+
+    const lat = lerDecimal(bytes, fimFaccao + bytesTimestamp.length + 4);
+    if (!(Math.abs(lat) <= 90)) return -1;
+
+    const lon = lerDecimal(bytes, fimDoUltimoDecimal + 1);
+    if (!(Math.abs(lon) <= 180)) return -1;
+
+    consumidor.aoLerPosicao(id, lat, lon);
+    return fimDaLinha(bytes, fimDoUltimoDecimal + 1) + 1;
+  }
+
+  /**
+   * Caminho lento: valida a linha inteira como texto. Trata o cabeçalho, a primeira linha de cada ID, a
+   * troca de timestamp e qualquer formato incomum. O `trim` remove o `\r`, os espaços e o BOM. Retorna
+   * `false` se o consumidor interromper a leitura.
+   */
+  function processarLinhaLenta(linhaBruta: string): boolean {
     const linha = linhaBruta.trim();
-    if (linha === "" || linha.startsWith(CABECALHO)) return;
+    if (linha === "" || linha.startsWith(CABECALHO)) return true;
 
     const posicao = parsearPosicao(linha);
     if (posicao === null) {
       linhasInvalidas++;
-      return;
+      return true;
     }
 
     if (!cadastro.has(posicao.id)) {
       const pessoa = parsearPessoa(posicao.id, linha);
       if (pessoa === null) {
         linhasInvalidas++;
-        return;
+        return true;
       }
       cadastro.set(posicao.id, pessoa);
+      if (posicao.id < LIMITE_ID_RAPIDO) idsConhecidos[posicao.id] = 1;
     }
 
-    posicao.timestamp = copiarTimestamp(posicao.timestamp);
-    aoLerPosicao(posicao);
+    if (posicao.timestamp !== timestampAtual) {
+      timestampAtual = posicao.timestamp;
+      bytesTimestamp = Buffer.from(timestampAtual);
+      if (!consumidor.aoMudarTimestamp(timestampAtual)) return false;
+    }
+
+    consumidor.aoLerPosicao(posicao.id, posicao.lat, posicao.lon);
+    return true;
   }
 
   return {
-    processarTexto(texto: string): void {
+    /** `bytes[limite - 1]` precisa ser uma quebra de linha. Retorna `false` se a leitura for interrompida. */
+    processarBytes(bytes: Buffer, limite: number): boolean {
       let inicio = 0;
-      while (inicio < texto.length) {
-        const quebra = texto.indexOf("\n", inicio);
-        const fim = quebra === -1 ? texto.length : quebra;
-        processarLinha(texto.slice(inicio, fim));
+      while (inicio < limite) {
+        const proxima = processarLinhaRapida(bytes, inicio);
+        if (proxima >= 0) {
+          inicio = proxima;
+          continue;
+        }
+
+        const fim = fimDaLinha(bytes, inicio);
+        if (!processarLinhaLenta(bytes.toString("utf8", inicio, fim))) return false;
         inicio = fim + 1;
       }
+      return true;
     },
 
     concluir(): DadosEntrada {
@@ -118,10 +179,87 @@ function criarLeitor(aoLerPosicao: AoLerPosicao) {
   };
 }
 
+/** Posição do próximo `;`, ou -1 se a linha acabar antes. A quebra de linha final garante que o laço termina. */
+function fimDoCampo(bytes: Buffer, inicio: number): number {
+  for (let i = inicio; ; i++) {
+    const byte = bytes[i];
+    if (byte === PONTO_E_VIRGULA) return i;
+    if (byte === QUEBRA_DE_LINHA) return -1;
+  }
+}
+
+function fimDaLinha(bytes: Buffer, inicio: number): number {
+  let i = inicio;
+  while (bytes[i] !== QUEBRA_DE_LINHA) i++;
+  return i;
+}
+
+/** Retorna -1 se o trecho estiver vazio ou tiver algo além de dígitos. */
+function lerInteiro(bytes: Buffer, inicio: number, fim: number): number {
+  if (inicio === fim) return -1;
+
+  let valor = 0;
+  for (let i = inicio; i < fim; i++) {
+    const byte = bytes[i];
+    if (byte < DIGITO_0 || byte > DIGITO_9) return -1;
+    valor = valor * 10 + (byte - DIGITO_0);
+  }
+  return valor;
+}
+
 /**
- * Lê só os campos que mudam a cada linha. Usa `indexOf` em vez de `split` porque esta função roda em
- * todas as linhas e não precisa dos campos do fim. O teste de `Math.abs` é escrito pela positiva porque
- * NaN falha em qualquer comparação, inclusive nessa.
+ * Lê um decimal simples terminado em `;` (`-13.06443;`) e retorna NaN para qualquer outro formato. Dá o
+ * mesmo double que `Number()`: com até 15 dígitos, a mantissa e a potência de 10 são exatas em double, e a
+ * divisão IEEE arredonda corretamente o quociente.
+ *
+ * Grava a posição do `;` em `fimDoUltimoDecimal`, para quem chama não percorrer o campo duas vezes:
+ * retornar os dois valores em um objeto criaria uma alocação por coordenada.
+ */
+function lerDecimal(bytes: Buffer, inicio: number): number {
+  const negativo = bytes[inicio] === HIFEN;
+  let mantissa = 0;
+  let digitos = 0;
+  let casas = 0;
+  let depoisDoPonto = false;
+  let i = negativo ? inicio + 1 : inicio;
+
+  for (; ; i++) {
+    const byte = bytes[i];
+    if (byte >= DIGITO_0 && byte <= DIGITO_9) {
+      mantissa = mantissa * 10 + (byte - DIGITO_0);
+      digitos++;
+      if (depoisDoPonto) casas++;
+    } else if (byte === PONTO && !depoisDoPonto) {
+      depoisDoPonto = true;
+    } else if (byte === PONTO_E_VIRGULA) {
+      break;
+    } else {
+      return NaN;
+    }
+  }
+
+  if (digitos === 0 || digitos > MAX_DIGITOS_EXATOS) return NaN;
+  fimDoUltimoDecimal = i;
+  const valor = mantissa / POTENCIAS_DE_10[casas];
+  return negativo ? -valor : valor;
+}
+
+/** Confere o campo `"<timestamp>";`. Os segundos ficam no fim, então comparar de trás para frente falha mais cedo. */
+function ehTimestamp(bytes: Buffer, inicio: number, timestamp: Buffer): boolean {
+  const tamanho = timestamp.length;
+  if (bytes[inicio] !== ASPAS || bytes[inicio + tamanho + 1] !== ASPAS || bytes[inicio + tamanho + 2] !== PONTO_E_VIRGULA) {
+    return false;
+  }
+
+  for (let i = tamanho - 1; i >= 0; i--) {
+    if (bytes[inicio + 1 + i] !== timestamp[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * Lê só os campos que mudam a cada linha, no caminho lento. O teste de `Math.abs` é escrito pela positiva
+ * porque NaN falha em qualquer comparação, inclusive nessa.
  */
 function parsearPosicao(linha: string): Posicao | null {
   const fimId = linha.indexOf(";");
@@ -179,28 +317,6 @@ function completarVinculos(cadastro: Map<number, Pessoa>): void {
       cadastro.get(agressor)?.restricoes.add(pessoa.id);
     }
   }
-}
-
-/**
- * Guarda uma única cópia de cada timestamp. Um `slice` mantém viva a string de origem, então guardar o
- * timestamp recortado prenderia o bloco inteiro de 64 MB na memória enquanto a posição existir. O atalho
- * do último timestamp vale porque as linhas de um mesmo timestamp costumam estar juntas.
- */
-function criarCopiadorDeTimestamps(): (timestamp: string) => string {
-  const copias = new Map<string, string>();
-  let ultimo = "";
-
-  return (timestamp) => {
-    if (timestamp === ultimo) return ultimo;
-
-    let copia = copias.get(timestamp);
-    if (copia === undefined) {
-      copia = Buffer.from(timestamp).toString();
-      copias.set(copia, copia);
-    }
-    ultimo = copia;
-    return copia;
-  };
 }
 
 /** `Number("")` e `Number(" ")` valem 0: sem este teste, um campo vazio viraria uma coordenada real. */
